@@ -1,0 +1,502 @@
+openapi: 3.1.0
+info:
+  title: Api
+  version: 0.1.0
+  description: AI Minecraft Mod API
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: openai
+    description: OpenAI AI chat, image, and audio operations
+  - name: mod
+    description: AI Player Mod operations
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /openai/conversations:
+    get:
+      operationId: listOpenaiConversations
+      tags: [openai]
+      summary: List all conversations
+      responses:
+        "200":
+          description: List of conversations
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/OpenaiConversation"
+    post:
+      operationId: createOpenaiConversation
+      tags: [openai]
+      summary: Create a new conversation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateOpenaiConversationBody"
+      responses:
+        "201":
+          description: Created conversation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpenaiConversation"
+  /openai/conversations/{id}:
+    get:
+      operationId: getOpenaiConversation
+      tags: [openai]
+      summary: Get conversation with messages
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Conversation with messages
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpenaiConversationWithMessages"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpenaiError"
+    delete:
+      operationId: deleteOpenaiConversation
+      tags: [openai]
+      summary: Delete a conversation
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpenaiError"
+  /openai/conversations/{id}/messages:
+    get:
+      operationId: listOpenaiMessages
+      tags: [openai]
+      summary: List messages in a conversation
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: List of messages
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/OpenaiMessage"
+    post:
+      operationId: sendOpenaiMessage
+      tags: [openai]
+      summary: Send a text message and receive a streaming text response
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendOpenaiMessageBody"
+      responses:
+        "200":
+          description: SSE stream of assistant text chunks
+          content:
+            text/event-stream: {}
+
+  /mod/chat:
+    post:
+      operationId: processModChat
+      tags: [mod]
+      summary: Process a Minecraft chat message and get AI response with actions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ModChatRequest"
+      responses:
+        "200":
+          description: AI response with parsed actions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModChatResponse"
+
+  /mod/logs:
+    get:
+      operationId: getModLogs
+      tags: [mod]
+      summary: Get recent mod action logs
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: List of recent mod logs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ModLog"
+    post:
+      operationId: addModLog
+      tags: [mod]
+      summary: Add a mod action log entry
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AddModLogBody"
+      responses:
+        "201":
+          description: Created log entry
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModLog"
+
+  /mod/config:
+    get:
+      operationId: getModConfig
+      tags: [mod]
+      summary: Get current mod configuration
+      responses:
+        "200":
+          description: Mod configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModConfig"
+    patch:
+      operationId: updateModConfig
+      tags: [mod]
+      summary: Update mod configuration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateModConfigBody"
+      responses:
+        "200":
+          description: Updated mod configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModConfig"
+
+  /mod/commands:
+    get:
+      operationId: listSupportedCommands
+      tags: [mod]
+      summary: List all supported AI commands
+      responses:
+        "200":
+          description: List of supported commands
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SupportedCommand"
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+
+    OpenaiConversation:
+      type: object
+      properties:
+        id:
+          type: integer
+        title:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - title
+        - createdAt
+    OpenaiMessage:
+      type: object
+      properties:
+        id:
+          type: integer
+        conversationId:
+          type: integer
+        role:
+          type: string
+        content:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - conversationId
+        - role
+        - content
+        - createdAt
+    CreateOpenaiConversationBody:
+      type: object
+      properties:
+        title:
+          type: string
+      required:
+        - title
+    SendOpenaiMessageBody:
+      type: object
+      properties:
+        content:
+          type: string
+      required:
+        - content
+    OpenaiConversationWithMessages:
+      type: object
+      properties:
+        id:
+          type: integer
+        title:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/OpenaiMessage"
+      required:
+        - id
+        - title
+        - createdAt
+        - messages
+    OpenaiError:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error
+
+    ModChatRequest:
+      type: object
+      properties:
+        message:
+          type: string
+          description: The chat message to process
+        playerName:
+          type: string
+          description: Name of the player who sent the message
+        context:
+          type: string
+          description: Optional context about the current game state
+      required:
+        - message
+        - playerName
+
+    ModAction:
+      type: object
+      properties:
+        type:
+          type: string
+          description: Action type (move, attack, mine, place, craft, eat, sleep, follow, stop, say, etc.)
+        target:
+          type: ["string", "null"]
+          description: Target block, entity or player
+        direction:
+          type: ["string", "null"]
+          description: Direction (north, south, east, west, up, down)
+        quantity:
+          type: ["integer", "null"]
+          description: Quantity for crafting or collecting
+        extra:
+          type: ["string", "null"]
+          description: Extra parameters for the action
+      required:
+        - type
+
+    ModChatResponse:
+      type: object
+      properties:
+        reply:
+          type: string
+          description: Natural language reply to the player
+        actions:
+          type: array
+          items:
+            $ref: "#/components/schemas/ModAction"
+          description: List of parsed actions for the mod to execute
+        understood:
+          type: boolean
+          description: Whether the AI understood the request
+      required:
+        - reply
+        - actions
+        - understood
+
+    ModLog:
+      type: object
+      properties:
+        id:
+          type: integer
+        playerName:
+          type: string
+        message:
+          type: string
+        reply:
+          type: string
+        actions:
+          type: string
+          description: JSON-encoded list of actions
+        timestamp:
+          type: string
+          format: date-time
+        success:
+          type: boolean
+      required:
+        - id
+        - playerName
+        - message
+        - reply
+        - actions
+        - timestamp
+        - success
+
+    AddModLogBody:
+      type: object
+      properties:
+        playerName:
+          type: string
+        message:
+          type: string
+        reply:
+          type: string
+        actions:
+          type: string
+        success:
+          type: boolean
+      required:
+        - playerName
+        - message
+        - reply
+        - actions
+        - success
+
+    ModConfig:
+      type: object
+      properties:
+        id:
+          type: integer
+        enabled:
+          type: boolean
+        triggerPrefix:
+          type: string
+          description: Prefix in chat that triggers the AI (e.g. "!ai")
+        respondToAll:
+          type: boolean
+          description: Whether the AI responds to all chat messages
+        language:
+          type: string
+          description: Response language (e.g. "tr", "en")
+        personality:
+          type: string
+          description: AI personality description
+        maxActionsPerCommand:
+          type: integer
+        updatedAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - enabled
+        - triggerPrefix
+        - respondToAll
+        - language
+        - personality
+        - maxActionsPerCommand
+        - updatedAt
+
+    UpdateModConfigBody:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        triggerPrefix:
+          type: string
+        respondToAll:
+          type: boolean
+        language:
+          type: string
+        personality:
+          type: string
+        maxActionsPerCommand:
+          type: integer
+
+    SupportedCommand:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        examples:
+          type: array
+          items:
+            type: string
+      required:
+        - name
+        - description
+        - examples
