@@ -21,5 +21,7 @@ public class FoxAINetwork {
             ActionPacket::encode, ActionPacket::decode, ActionPacket::handle);
         CHANNEL.registerMessage(id++, FoxSayPacket.class,
             FoxSayPacket::encode, FoxSayPacket::decode, FoxSayPacket::handle);
+        CHANNEL.registerMessage(id++, FoxAIContextPacket.class,
+            FoxAIContextPacket::encode, FoxAIContextPacket::decode, FoxAIContextPacket::handle);
     }
 }

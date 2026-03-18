@@ -22,6 +22,9 @@ public class AiPlayerMod {
         // Entity tiplerini kaydet
         FoxAIEntity.ENTITY_TYPES.register(modBus);
 
+        // Menu tiplerini kaydet (envanter GUI için)
+        FoxAIMenuType.MENU_TYPES.register(modBus);
+
         modBus.addListener(this::commonSetup);
         modBus.addListener(this::clientSetup);
         modBus.addListener(this::onRegisterRenderers);
@@ -34,7 +37,6 @@ public class AiPlayerMod {
     }
 
     private void commonSetup(final FMLCommonSetupEvent event) {
-        // Forge network kanalını kaydet
         event.enqueueWork(FoxAINetwork::register);
         LOGGER.info("[FoxAI] Ortak kurulum & network kaydı tamamlandı.");
     }
@@ -47,5 +49,4 @@ public class AiPlayerMod {
     public void onRegisterRenderers(EntityRenderersEvent.RegisterRenderers event) {
         event.registerEntityRenderer(FoxAIEntity.FOXAI.get(), FoxAIEntity.Renderer::new);
     }
-
 }

@@ -36,6 +36,10 @@ import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.Tag;
+import net.minecraft.world.entity.ai.navigation.GroundPathNavigation;
+import net.minecraft.world.entity.ai.navigation.WaterBoundPathNavigation;
+import net.minecraft.core.Direction;
+import net.minecraft.nbt.Tag;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -43,6 +47,9 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 public class FoxAIEntity extends PathfinderMob implements MenuProvider {
 
     // ── Craft State Machine ────────────────────────────────────────────────
+    // ── Görev Zinciri Sistemi ─────────────────────────────────────────────
+    public final FoxAITaskSystem taskSystem = new FoxAITaskSystem(this);
+
     private enum CraftState { IDLE, GATHERING_WOOD, GOING_TO_TABLE, CRAFTING }
     private CraftState craftState = CraftState.IDLE;
     private String pendingToolType = null;
@@ -82,6 +89,27 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
         this.setCanPickUpLoot(true);
     }
 
+    @Override
+    protected net.minecraft.world.entity.ai.navigation.PathNavigation createNavigation(Level level) {
+        GroundPathNavigation nav = new GroundPathNavigation(this, level);
+        nav.setCanOpenDoors(true);
+        nav.setCanPassDoors(true);
+        nav.setCanFloat(true); // Suda yüzebilir
+        return nav;
+    }
+
+    @Override
+    public int getMaxFallDistance() {
+        // Envanterinde su kovası varsa daha yüksekten düşebilir
+        if (countItem("water_bucket") > 0) return 20;
+        return 4; // Normal fall damage limiti
+    }
+
+    @Override
+    protected float getStepHeight() {
+        return 1.0f; // Vanilla 0.6f, biz 1 blok tırmanabiliriz
+    }
+
     public void setOwner(Player player) {
         this.owner = player.getUUID();
     }
@@ -101,10 +129,10 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
         return InteractionResult.sidedSuccess(this.level().isClientSide());
     }
 
-    // MenuProvider implementasyonu
+    // MenuProvider implementasyonu — sadece GUI başlığı için
     @Override
     public Component getDisplayName() {
-        return Component.literal("§6FoxAI Envanteri");
+        return Component.literal("FoxAI Envanteri");
     }
 
     @Override
@@ -158,14 +186,39 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
     @Override
     protected void registerGoals() {
         this.goalSelector.addGoal(0, new FoxAIActionGoal(this));
-        this.goalSelector.addGoal(1, new FloatGoal(this));
+        this.goalSelector.addGoal(1, new FloatGoal(this));          // Suda yüz
         this.goalSelector.addGoal(2, new FoxAIFollowGoal(this));
         this.goalSelector.addGoal(3, new MeleeAttackGoal(this, 1.2, true));
-        this.goalSelector.addGoal(4, new WaterAvoidingRandomStrollGoal(this, 0.8));
+        this.goalSelector.addGoal(4, new RandomStrollGoal(this, 0.8)); // Su dahil her yerde gezin
         this.goalSelector.addGoal(5, new LookAtPlayerGoal(this, Player.class, 8.0f));
         this.goalSelector.addGoal(6, new RandomLookAroundGoal(this));
         this.targetSelector.addGoal(1, new HurtByTargetGoal(this));
         this.targetSelector.addGoal(2, new NearestAttackableTargetGoal<>(this, Monster.class, true));
+    }
+
+    @Override
+    public boolean canSwim() { return true; }
+
+    @Override
+    protected void checkFallDamage(double y, boolean onGround, BlockState state, BlockPos pos) {
+        // Fall damage hesapla ama su kovası veya merdiven varsa engelle
+        if (onGround && this.fallDistance > 3) {
+            if (this.inventory != null) {
+                for (int i = 0; i < this.inventory.getContainerSize(); i++) {
+                    var st = this.inventory.getItem(i);
+                    if (!st.isEmpty() && st.getDescriptionId().contains("water_bucket")) {
+                        // Su kovası var, MLG yap
+                        this.fallDistance = 0;
+                        BlockPos below = this.blockPosition().below();
+                        if (this.level().isEmptyBlock(below))
+                            this.level().setBlockAndUpdate(below, Blocks.WATER.defaultBlockState());
+                        broadcastToNearby("💧 MLG su! Fall damage yok 😎");
+                        return;
+                    }
+                }
+            }
+        }
+        super.checkFallDamage(y, onGround, state, pos);
     }
 
     // ── Dışarıdan Çağrılan API ────────────────────────────────────────────
@@ -198,12 +251,46 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
 
     // ── Tick ───────────────────────────────────────────────────────────────
 
+    private int contextTickCounter = 0;
+
+    // ── Hayatta Kalma State ────────────────────────────────────────────────
+    private enum SurvivalState { IDLE, FLEEING, EATING, HEALING, BUILDING_SHELTER, SLEEPING, MORNING_ROUTINE }
+    private SurvivalState survivalState = SurvivalState.IDLE;
+    private int survivalTimer = 0;
+    private boolean shelterBuilt = false;
+    private BlockPos shelterPos = null;
+
     @Override
     public void tick() {
         super.tick();
+        if (this.level().isClientSide()) return;
+
+        // Guard sistemi
         if (guardTarget != null && guardTarget.isAlive() && !isBusy) {
             LivingEntity threat = findNearbyThreat();
             if (threat != null) this.setTarget(threat);
+        }
+
+        // Context paketi (her 2 saniye)
+        if (++contextTickCounter >= 40) {
+            contextTickCounter = 0;
+            String ctx = buildWorldContext();
+            FoxAINetwork.CHANNEL.send(
+                net.minecraftforge.network.PacketDistributor.NEAR.with(() ->
+                    new net.minecraftforge.network.PacketDistributor.TargetPoint(
+                        this.getX(), this.getY(), this.getZ(), 64, this.level().dimension())),
+                new FoxAIContextPacket(ctx)
+            );
+        }
+
+        // Görev zinciri sistemi
+        if (taskSystem.isActive()) {
+            taskSystem.tick();
+        }
+
+        // Hayatta kalma sistemi (meşgul değilken ve görev yokken çalışır)
+        if (!isBusy && !taskSystem.isActive()) {
+            tickSurvival();
         }
     }
 
@@ -292,7 +379,24 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
                 else broadcastToNearby("§a👋 selamlar! Ben FoxAI 🦊");
                 yield true;
             }
-            case "stop", "stop_follow" -> { clearQueue(); yield true; }
+            case "stop", "stop_follow" -> {
+                clearQueue();
+                if (taskSystem.isActive()) taskSystem.cancel();
+                yield true;
+            }
+            // Görev zinciri başlatma
+            case "task" -> {
+                String taskMsg = coal(target, message, extra);
+                if (taskMsg != null) {
+                    FoxAITaskSystem.TaskType tt = FoxAITaskSystem.parseCommand(taskMsg);
+                    if (tt != null) {
+                        taskSystem.start(tt);
+                    } else {
+                        broadcastToNearby("§c❓ Görev anlaşılamadı: " + taskMsg);
+                    }
+                }
+                yield true;
+            }
 
             // ── Hareket ──────────────────────────────────────────────────
             case "move"   -> executeMove(dir, steps, target, 1.0);
@@ -346,15 +450,56 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
 
     // ── Hareket ───────────────────────────────────────────────────────────
 
+    private BlockPos moveTarget = null;
+    private int stuckCounter = 0;
+    private Vec3 lastPos = null;
+
     private boolean executeMove(String dir, int steps, String targetName, double speed) {
         if (actionTimer == 0) {
-            BlockPos dest = resolveDestination(dir, steps, targetName);
-            if (dest != null) {
-                this.getNavigation().moveTo(dest.getX()+0.5, dest.getY(), dest.getZ()+0.5, speed);
+            moveTarget = resolveDestination(dir, steps, targetName);
+            stuckCounter = 0;
+            lastPos = this.position();
+            if (moveTarget != null) {
+                // Navigation ayarları — tırmanma ve yüzme aktif
+                if (this.getNavigation() instanceof GroundPathNavigation nav) {
+                    nav.setCanOpenDoors(true);
+                    nav.setCanPassDoors(true);
+                }
+                this.getNavigation().moveTo(moveTarget.getX()+0.5, moveTarget.getY(), moveTarget.getZ()+0.5, speed);
                 broadcastToNearby("🚶 " + dirTR(dir) + " gidiyorum...");
             }
         }
-        return !this.getNavigation().isInProgress() && actionTimer > 5;
+
+        if (moveTarget == null) return true;
+
+        // Takılma tespiti: her 10 tick'te pozisyon kontrolü
+        if (actionTimer % 10 == 0) {
+            Vec3 curPos = this.position();
+            if (lastPos != null && curPos.distanceTo(lastPos) < 0.3) {
+                stuckCounter++;
+                if (stuckCounter >= 2) {
+                    // Takıldı — zıpla ve farklı path dene
+                    this.jumpFromGround();
+                    stuckCounter = 0;
+                    // Path'i yenile
+                    this.getNavigation().moveTo(moveTarget.getX()+0.5, moveTarget.getY(), moveTarget.getZ()+0.5, speed);
+                }
+            } else {
+                stuckCounter = 0;
+            }
+            lastPos = curPos;
+        }
+
+        // Suda mıyız? Zıplayarak yüz
+        if (this.isInWater()) {
+            this.jumpFromGround();
+        }
+
+        // Hedefe yeterince yaklaştık mı?
+        double distToTarget = this.blockPosition().distSqr(moveTarget);
+        if (distToTarget < 4.0) return true; // 2 blok içinde
+
+        return !this.getNavigation().isInProgress() && actionTimer > 10;
     }
 
     private BlockPos resolveDestination(String dir, int steps, String targetName) {
@@ -402,7 +547,7 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
     }
 
     /** En iyi baltayı/kazımayı/kılıcı ele al. toolType: "axe", "pickaxe", "sword", "shovel" */
-    private boolean equipBestTool(String toolType) {
+    public boolean equipBestTool(String toolType) {
         ItemStack best = ItemStack.EMPTY;
         int bestTier = -1;
         for (var slot : this.getHandSlots()) {
@@ -468,29 +613,40 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
      * @return true  → alet hazır, aksiyona devam et
      *         false → henüz hazır değil, bu tick'te bekle
      */
-    private boolean ensureTool(String toolType) {
+    public boolean ensureTool(String toolType) {
         // Craft zaten devam ediyorsa state machine'i çalıştır
         if (craftState != CraftState.IDLE) {
             boolean done = runCraftStateMachine(pendingToolType != null ? pendingToolType : toolType);
             if (done) {
                 craftState = CraftState.IDLE;
                 pendingToolType = null;
+                // Craft bitti, şimdi tekrar alet kontrolü yap
+                if (equipBestTool(toolType)) return true;
+                // Alet hâlâ yoksa (craft başarısız) elle devam et
                 return true;
             }
             return false;
         }
 
-        // İyi bir alet elimizde mi?
+        // İyi bir alet elimizde mi? (sadece actionTimer == 0 yani ilk tick'te karar ver)
+        if (actionTimer > 0) {
+            // Sonraki tick'lerde sadece elimdekini kullan, yeniden craft başlatma
+            return true;
+        }
+
         if (equipBestTool(toolType)) {
             int tier = toolTier(this.getMainHandItem().getDescriptionId().toLowerCase());
             if (tier >= 2) return true; // taş ve üzeri → yeterli
-            broadcastToNearby("🔧 §e" + this.getMainHandItem().getDisplayName().getString()
-                + " §7var ama zayıf, daha iyisini yapıyorum...");
+            if (tier >= 1) {
+                // Tahta alet var ama zayıf — daha iyisini yapmayı dene
+                broadcastToNearby("🔧 §e" + this.getMainHandItem().getDisplayName().getString()
+                    + " §7var ama zayıf, daha iyisini yapıyorum...");
+            }
         } else {
             broadcastToNearby("🔧 §e" + toolType + " §7yok! Otomatik craft başlatıyorum...");
         }
 
-        // Craft başlat (sadece bir kez)
+        // Craft başlat (sadece bir kez — actionTimer == 0 garantisi var)
         craftState = CraftState.GATHERING_WOOD;
         pendingToolType = toolType;
         craftWaitTicks = 0;
@@ -514,14 +670,26 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
         }
 
         double dist = this.distanceToSqr(Vec3.atCenterOf(found));
-        if (dist > 9.0) {
-            this.getNavigation().moveTo(found.getX()+0.5, found.getY(), found.getZ()+0.5, 1.1);
+        if (dist > 6.0) { // 2.5 blok mesafe yeterli
+            // Hedefe giderken takılıyor mu?
+            if (actionTimer % 15 == 0 && this.getNavigation().isInProgress()) {
+                // Path yenile
+                this.getNavigation().moveTo(found.getX()+0.5, found.getY(), found.getZ()+0.5, 1.2);
+            } else if (!this.getNavigation().isInProgress()) {
+                this.jumpFromGround(); // Belki bir blok önünde duvar var
+                this.getNavigation().moveTo(found.getX()+0.5, found.getY(), found.getZ()+0.5, 1.2);
+            }
             return false;
         }
+
+        // Bloğa bak
+        Vec3 blockCenter = Vec3.atCenterOf(found);
+        this.getLookControl().setLookAt(blockCenter.x, blockCenter.y, blockCenter.z, 30, 30);
 
         if (!this.level().isClientSide()) {
             String bName = this.level().getBlockState(found).getBlock().getName().getString();
             this.level().destroyBlock(found, true, this);
+            pickupNearbyItems();
             broadcastToNearby("⛏️ §e" + bName + " §7kırıldı! " + (qty > 1 ? (qty-1) + " kaldı" : ""));
         }
         return qty <= 1;
@@ -624,14 +792,31 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
                     return true;
                 }
 
-                // Gerçek craft olmadı → sihirli craft
-                broadcastToNearby("⚠ gerçek craft olmadı, sihirle yapıyorum 🪄");
+                // tryCraftTool başarısız → son çare sihirli craft
+                // NOT: Bu noktaya sadece malzeme gerçekten yoksa gelinir
+                broadcastToNearby("⚠ malzeme yetersiz, sihirle yapıyorum 🪄");
                 net.minecraft.world.item.Item magic = getMagicCraftItem(toolType);
                 if (magic != null && !this.level().isClientSide()) {
+                    // Sihirli craftta da mevcut malzemeleri tüket (ne kadar varsa)
+                    String mat = getBestMaterial();
+                    int neededMat = switch (toolType) { case "sword" -> 2; case "shovel" -> 1; default -> 3; };
+                    int neededStick = "sword".equals(toolType) ? 1 : 2;
+                    // Stick yoksa üret
+                    if (countItem("stick") < neededStick && countItem("planks") >= 2) {
+                        consumeItem("planks", 2);
+                        giveItem(new net.minecraft.world.item.ItemStack(Items.STICK, 4));
+                    } else if (countItem("stick") < neededStick && countItem("log") >= 1) {
+                        consumeItem("log", 1);
+                        giveItem(new net.minecraft.world.item.ItemStack(Items.OAK_PLANKS, 4));
+                        consumeItem("planks", 2);
+                        giveItem(new net.minecraft.world.item.ItemStack(Items.STICK, 4));
+                    }
+                    // Elindeki kadar malzemeyi tüket
+                    consumeItem(mat, Math.min(neededMat, countItem(mat)));
+                    consumeItem("stick", Math.min(neededStick, countItem("stick")));
                     giveItem(new net.minecraft.world.item.ItemStack(magic, 1));
                     equipBestTool(toolType);
-                    broadcastToNearby("✅ §e" + this.getMainHandItem().getDisplayName().getString()
-                        + " §7envanterime eklendi!");
+                    broadcastToNearby("✅ §e" + this.getMainHandItem().getDisplayName().getString() + " §7yaptım!");
                 }
                 return true;
             }
@@ -642,8 +827,7 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
 
     /** Alet yapmak için yeterli malzeme var mı? */
     private boolean hasCraftMaterials(String toolType) {
-        // Kılıç için 2 malzeme yeterli, diğerleri için 3
-        int needed = "sword".equals(toolType) ? 2 : 3;
+        int needed = 2; // 2 yeterli (sword için de, diğerleri için de)
         return countItem("diamond") >= needed ||
                countItem("iron_ingot") >= needed ||
                countItem("cobblestone") >= needed ||
@@ -652,7 +836,17 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
                countItem("log") >= 1; // 1 log → 4 planks → yeterli
     }
 
-    /** Gerçek craft: malzemeleri tüket, aleti ver */
+    /**
+     * Gerçek craft: Minecraft tariflerine uygun malzeme tüketimi + aleti ver.
+     *
+     * Tarifler:
+     *   axe/pickaxe  → 3 malzeme + 2 stick
+     *   sword        → 2 malzeme + 1 stick
+     *   shovel       → 1 malzeme + 2 stick
+     *
+     * Malzeme önceliği: elmas > demir > taş/çakıl > tahta
+     * Stick yoksa: log → planks → stick zinciri
+     */
     private boolean tryCraftTool(String toolType) {
         if (this.level().isClientSide()) return false;
         try {
@@ -660,35 +854,61 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
             if (result == null) return false;
 
             String material = getBestMaterial();
-            int needed = "sword".equals(toolType) ? 2 : 3;
 
-            // Stick yap (log → planks → stick)
-            if (countItem("stick") < 2) {
+            // Her alet tipi için gereken miktarlar (Minecraft tarifleri)
+            int neededMat   = switch (toolType) {
+                case "sword"  -> 2;
+                case "shovel" -> 1;
+                default       -> 3; // axe, pickaxe
+            };
+            int neededStick = switch (toolType) {
+                case "sword" -> 1;
+                default      -> 2; // axe, pickaxe, shovel
+            };
+
+            // Stick yoksa üret: log → planks → stick
+            if (countItem("stick") < neededStick) {
+                // Planks yoksa logdan üret
                 if (countItem("planks") < 2 && countItem("log") >= 1) {
-                    giveItem(new net.minecraft.world.item.ItemStack(Items.OAK_PLANKS, 4));
                     consumeItem("log", 1);
+                    giveItem(new net.minecraft.world.item.ItemStack(Items.OAK_PLANKS, 4));
+                    broadcastToNearby("🪵 log → 4 tahta yaptım");
                 }
+                // Stickları üret
                 if (countItem("planks") >= 2) {
-                    giveItem(new net.minecraft.world.item.ItemStack(Items.STICK, 4));
                     consumeItem("planks", 2);
+                    giveItem(new net.minecraft.world.item.ItemStack(Items.STICK, 4));
+                    broadcastToNearby("🥢 tahta → çubuk yaptım");
                 }
             }
 
-            if (countItem("stick") < 2 || countItem(material) < needed) return false;
+            // Malzeme ve stick yeterli mi?
+            if (countItem("stick") < neededStick || countItem(material) < neededMat) {
+                broadcastToNearby("§cMalzeme yetmedi: " + neededMat + "x " + material
+                    + " + " + neededStick + "x stick lazım");
+                return false;
+            }
 
-            consumeItem("stick", 2);
-            consumeItem(material, needed);
+            // Malzemeleri tüket ve aleti ver
+            consumeItem(material, neededMat);
+            consumeItem("stick", neededStick);
             giveItem(new net.minecraft.world.item.ItemStack(result, 1));
+            broadcastToNearby("🔨 " + neededMat + "x §e" + material
+                + " §7+ " + neededStick + "x stick → §e"
+                + result.getDescriptionId().replace("item.minecraft.", "") + " §7✅");
             return true;
-        } catch (Exception e) { return false; }
+        } catch (Exception e) {
+            broadcastToNearby("§cCraft hatası: " + e.getMessage());
+            return false;
+        }
     }
 
     /** En iyi mevcut malzemeyi döndür */
     private String getBestMaterial() {
-        int needed2 = 2; int needed3 = 3;
-        if (countItem("diamond") >= needed3)    return "diamond";
-        if (countItem("iron_ingot") >= needed3) return "iron_ingot";
-        if (countItem("cobblestone") >= needed3 || countItem("stone") >= needed3) return "cobblestone";
+        if (countItem("diamond") >= 2)    return "diamond";
+        if (countItem("iron_ingot") >= 2) return "iron_ingot";
+        // cobblestone veya stone — ikisi de taş alet yapar
+        if (countItem("cobblestone") >= 2 || countItem("stone") >= 2) return "cobblestone";
         return "planks";
     }
 
@@ -722,7 +942,7 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
 
     /** Envanterdeki belirli item sayısını say (el + zırh slotları) */
     /** Yakındaki düşmüş itemleri FoxAI'nin eline al */
-    private void pickupNearbyItems() {
+    public void pickupNearbyItems() {
         if (this.level().isClientSide()) return;
         var items = this.level().getEntitiesOfClass(
             net.minecraft.world.entity.item.ItemEntity.class,
@@ -742,7 +962,7 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
         }
     }
 
-    private int countItem(String partialId) {
+    public int countItem(String partialId) {
         int count = 0;
         // El slotları
         for (var slot : this.getHandSlots())
@@ -762,7 +982,7 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
     }
 
     /** Envanterdeki belirli item'ı tüket */
-    private void consumeItem(String partialId, int amount) {
+    public void consumeItem(String partialId, int amount) {
         if (this.level().isClientSide()) return;
         int remaining = amount;
         // Önce el slotlarından tüket
@@ -787,7 +1007,7 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
     }
 
     /** FoxAI'ye item ver — önce ana envantere, doluysa ele, olmadı yere at */
-    private void giveItem(net.minecraft.world.item.ItemStack stack) {
+    public void giveItem(net.minecraft.world.item.ItemStack stack) {
         if (this.level().isClientSide()) return;
         // Ana envanterden boş slot bul
         for (int i = 0; i < inventory.getContainerSize(); i++) {
@@ -804,7 +1024,7 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
         }
     }
 
-    private BlockPos findBlock(String name, int radius) {
+    public BlockPos findBlock(String name, int radius) {
         BlockPos origin = this.blockPosition();
         String search = name == null ? "" : name.toLowerCase()
             .replace("tahta","log").replace("ahşap","log")
@@ -930,6 +1150,506 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
             if (p == null || !p.isAlive()) { fox.followTarget = null; return; }
             if (fox.distanceTo(p) > 5) fox.getNavigation().moveTo(p, 1.1);
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // ── HAYATTa KALMA SİSTEMİ ─────────────────────────────────────────────
+    // isBusy=false olduğunda her tick çalışır. Tehlike, açlık, gece algılar.
+    // ══════════════════════════════════════════════════════════════════════
+
+    private void tickSurvival() {
+        survivalTimer++;
+
+        // Öncelik sırası: Tehlike > Yaralanma > Açlık > Gece > Sabah Rutini
+        switch (survivalState) {
+            case IDLE -> checkSurvivalConditions();
+            case FLEEING -> tickFleeing();
+            case HEALING -> tickHealing();
+            case EATING -> tickEating();
+            case BUILDING_SHELTER -> tickBuildingShelter();
+            case SLEEPING -> tickSleeping();
+            case MORNING_ROUTINE -> tickMorningRoutine();
+        }
+    }
+
+    /** Her tick tehlikeleri kontrol et */
+    private void checkSurvivalConditions() {
+        // Sadece her 20 tick'te kontrol et (performans)
+        if (survivalTimer % 20 != 0) return;
+
+        float health = this.getHealth();
+        float maxHealth = this.getMaxHealth();
+        boolean isNight = this.level().isNight();
+
+        // 1. TEHLİKE: Can %30 altı + yakında düşman → KAÇ
+        if (health < maxHealth * 0.3f && hasNearbyHostile(8)) {
+            broadcastToNearby("§c💀 CAN AZ, KAÇIYORUM! (" + (int)health + "/" + (int)maxHealth + ")");
+            survivalState = SurvivalState.FLEEING;
+            survivalTimer = 0;
+            return;
+        }
+
+        // 2. İYİLEŞME: Can %60 altı + düşman yok → İyileş
+        if (health < maxHealth * 0.6f && !hasNearbyHostile(12)) {
+            survivalState = SurvivalState.HEALING;
+            survivalTimer = 0;
+            return;
+        }
+
+        // 3. AÇLIK: Envanterde yemek var mı kontrol
+        if (hasFood() && survivalTimer % 100 == 0) {
+            // Arada sırada yemek ye (simülasyon)
+            survivalState = SurvivalState.EATING;
+            survivalTimer = 0;
+            return;
+        }
+
+        // 4. GECE: Gece oldu ve açıkta mı?
+        if (isNight && !isInsideShelter() && !shelterBuilt) {
+            broadcastToNearby("§6🌙 Gece oluyor, sığınak arıyorum...");
+            survivalState = SurvivalState.BUILDING_SHELTER;
+            survivalTimer = 0;
+            return;
+        }
+
+        // 5. UYKU: Gece, sığınakta, yatak var
+        if (isNight && isInsideShelter() && findBlock("bed", 8) != null) {
+            survivalState = SurvivalState.SLEEPING;
+            survivalTimer = 0;
+            return;
+        }
+
+        // 6. SABAH RUTİNİ: Gündüz oldu, dışarı çık
+        if (!isNight && survivalState == SurvivalState.SLEEPING) {
+            survivalState = SurvivalState.MORNING_ROUTINE;
+            survivalTimer = 0;
+        }
+    }
+
+    // ── TEHLİKEDEN KAÇMA ─────────────────────────────────────────────────
+
+    private void tickFleeing() {
+        LivingEntity nearest = findNearestHostile(16);
+
+        if (nearest == null || survivalTimer > 100) {
+            // Tehlike geçti veya timeout
+            broadcastToNearby("§a😮‍💨 Tehlike geçti, duruyorum.");
+            survivalState = SurvivalState.IDLE;
+            return;
+        }
+
+        // Düşmandan ters yönde kaç
+        Vec3 fleeDir = this.position().subtract(nearest.position()).normalize();
+        Vec3 fleeTarget = this.position().add(fleeDir.scale(16));
+        BlockPos fleeTo = new BlockPos((int)fleeTarget.x, (int)this.getY(), (int)fleeTarget.z);
+
+        if (!this.getNavigation().isInProgress()) {
+            this.getNavigation().moveTo(fleeTo.getX(), fleeTo.getY(), fleeTo.getZ(), 1.5);
+        }
+
+        // Kaçarken can azsa yemek ye
+        if (hasFood() && this.getHealth() < this.getMaxHealth() * 0.5f) {
+            eatFood();
+        }
+    }
+
+    // ── İYİLEŞME ─────────────────────────────────────────────────────────
+
+    private void tickHealing() {
+        if (survivalTimer > 200 || this.getHealth() >= this.getMaxHealth() * 0.9f) {
+            survivalState = SurvivalState.IDLE;
+            return;
+        }
+
+        // Yemek ye (regeneration için)
+        if (survivalTimer % 40 == 0 && hasFood()) {
+            eatFood();
+            broadcastToNearby("§a🍖 İyileşmek için yiyorum... (" + (int)this.getHealth() + "/" + (int)this.getMaxHealth() + ")");
+        }
+
+        // Tehlike gelirse kaç
+        if (hasNearbyHostile(8)) {
+            survivalState = SurvivalState.FLEEING;
+            survivalTimer = 0;
+        }
+    }
+
+    // ── YİYECEK YÖNETİMİ ─────────────────────────────────────────────────
+
+    private void tickEating() {
+        if (hasFood()) {
+            eatFood();
+            broadcastToNearby("§a🍖 Yiyorum, mide dolu olsun!");
+        }
+        survivalState = SurvivalState.IDLE;
+    }
+
+    private boolean hasFood() {
+        for (int i = 0; i < this.inventory.getContainerSize(); i++) {
+            var st = this.inventory.getItem(i);
+            if (!st.isEmpty() && st.getItem().isEdible()) return true;
+        }
+        // El slotlarına da bak
+        for (var slot : this.getHandSlots())
+            if (!slot.isEmpty() && slot.getItem().isEdible()) return true;
+        return false;
+    }
+
+    private void eatFood() {
+        // En iyi yemeği bul ve ye (envanter + el)
+        ItemStack bestFood = ItemStack.EMPTY;
+        int bestNutrition = 0;
+        int bestSlot = -1;
+
+        for (int i = 0; i < this.inventory.getContainerSize(); i++) {
+            var st = this.inventory.getItem(i);
+            if (st.isEmpty() || !st.getItem().isEdible()) continue;
+            var fp = st.getItem().getFoodProperties(st, this);
+            int n = fp != null ? fp.getNutrition() : 1;
+            if (n > bestNutrition) { bestNutrition = n; bestFood = st; bestSlot = i; }
+        }
+
+        if (!bestFood.isEmpty() && bestSlot >= 0) {
+            this.inventory.getItem(bestSlot).shrink(1);
+            // Can yenile (simülasyon — gerçek yeme animasyonu yok mob'da)
+            this.heal(Math.min(bestNutrition * 0.5f, this.getMaxHealth() - this.getHealth()));
+        }
+    }
+
+    // ── GECE SIĞINAK ─────────────────────────────────────────────────────
+
+    private void tickBuildingShelter() {
+        if (survivalTimer > 400) {
+            // Timeout — elle idare et
+            broadcastToNearby("§c😅 Sığınak yapamadım, olduğum yerde kalıyorum.");
+            survivalState = SurvivalState.IDLE;
+            return;
+        }
+
+        // Yakında kapalı bir alan var mı? (köy evi, mağara vb.)
+        BlockPos existingShelter = findNearestShelter(32);
+        if (existingShelter != null) {
+            // Git içeri
+            double dist = this.distanceToSqr(Vec3.atCenterOf(existingShelter));
+            if (dist > 4) {
+                if (!this.getNavigation().isInProgress())
+                    this.getNavigation().moveTo(existingShelter.getX()+0.5, existingShelter.getY(), existingShelter.getZ()+0.5, 1.2);
+                return;
+            }
+            shelterPos = existingShelter;
+            shelterBuilt = true;
+            broadcastToNearby("§a🏠 Sığınak buldum, içerideyim!");
+            survivalState = SurvivalState.IDLE;
+            return;
+        }
+
+        // Sığınak yok — basit barınak yap (3x3 duvar + çatı)
+        if (survivalTimer == 1) {
+            broadcastToNearby("§6🏗️ Basit barınak yapıyorum...");
+            buildSimpleShelter();
+        }
+    }
+
+    /** 3x3 basit barınak inşa et */
+    private void buildSimpleShelter() {
+        if (this.level().isClientSide()) return;
+        BlockPos base = this.blockPosition();
+
+        // Envanterde tahta var mı?
+        if (countItem("log") < 9 && countItem("planks") < 9) {
+            broadcastToNearby("§c🪵 Barınak için yeterli malzeme yok!");
+            survivalState = SurvivalState.IDLE;
+            return;
+        }
+
+        // 3x3 duvarlar (yükseklik 3)
+        for (int x = -1; x <= 1; x++) {
+            for (int z = -1; z <= 1; z++) {
+                for (int y = 0; y <= 2; y++) {
+                    BlockPos bp = base.offset(x, y, z);
+                    if (x == 0 && z == 0) continue; // İç alan boş
+                    if (this.level().isEmptyBlock(bp)) {
+                        this.level().setBlockAndUpdate(bp, Blocks.OAK_PLANKS.defaultBlockState());
+                    }
+                }
+            }
+        }
+        // Çatı
+        for (int x = -1; x <= 1; x++)
+            for (int z = -1; z <= 1; z++)
+                this.level().setBlockAndUpdate(base.offset(x, 3, z), Blocks.OAK_PLANKS.defaultBlockState());
+
+        shelterPos = base;
+        shelterBuilt = true;
+        broadcastToNearby("§a🏠 Barınak tamamlandı! İçerideyim.");
+        survivalState = SurvivalState.SLEEPING;
+    }
+
+    // ── UYKU ─────────────────────────────────────────────────────────────
+
+    private void tickSleeping() {
+        // Gündüz olduysa uyan
+        if (!this.level().isNight()) {
+            broadcastToNearby("§e☀️ Günaydın! Yeni bir gün başlıyor.");
+            survivalState = SurvivalState.MORNING_ROUTINE;
+            survivalTimer = 0;
+            return;
+        }
+
+        // Yakında yatak var mı?
+        BlockPos bed = findBlock("bed", 8);
+        if (bed != null && survivalTimer == 1) {
+            double dist = this.distanceToSqr(Vec3.atCenterOf(bed));
+            if (dist > 4) {
+                this.getNavigation().moveTo(bed.getX()+0.5, bed.getY(), bed.getZ()+0.5, 1.0);
+            } else {
+                broadcastToNearby("§9😴 İyi geceler, sabaha kadar uyuyorum...");
+            }
+        }
+
+        // Gece boyunca bekle (düşman gelirse uyan)
+        if (hasNearbyHostile(10)) {
+            broadcastToNearby("§c😱 DÜŞMAN! Uyanıyorum!");
+            survivalState = SurvivalState.FLEEING;
+            survivalTimer = 0;
+        }
+    }
+
+    // ── SABAH RUTİNİ ─────────────────────────────────────────────────────
+
+    private void tickMorningRoutine() {
+        if (survivalTimer > 60) {
+            survivalState = SurvivalState.IDLE;
+            return;
+        }
+
+        if (survivalTimer == 1) {
+            broadcastToNearby("§e☀️ Günaydın kanka! Hazır mısın? 💪");
+            // Sabah yemek ye
+            if (hasFood()) {
+                eatFood();
+                broadcastToNearby("§a🍖 Kahvaltı yapıyorum, güne hazırım!");
+            }
+            // Sığınaktan çık
+            if (shelterPos != null) {
+                BlockPos outside = shelterPos.offset(2, 0, 0);
+                this.getNavigation().moveTo(outside.getX(), outside.getY(), outside.getZ(), 1.0);
+            }
+        }
+    }
+
+    // ── YARDIMCI KONTROLLER ───────────────────────────────────────────────
+
+    public boolean hasNearbyHostile(int radius) {
+        return !this.level().getEntitiesOfClass(Monster.class,
+            new AABB(this.blockPosition()).inflate(radius)).isEmpty();
+    }
+
+    private LivingEntity findNearestHostile(int radius) {
+        return this.level().getEntitiesOfClass(Monster.class,
+            new AABB(this.blockPosition()).inflate(radius))
+            .stream().min(java.util.Comparator.comparingDouble(e -> e.distanceTo(this)))
+            .orElse(null);
+    }
+
+    /** Etrafta kapalı bir alan var mı? (ışık seviyesi düşük = içeride) */
+    private boolean isInsideShelter() {
+        return this.level().getMaxLocalRawBrightness(this.blockPosition()) < 7;
+    }
+
+    /** En yakın kapalı alanı bul (köy evi, mağara girişi) */
+    private BlockPos findNearestShelter(int radius) {
+        BlockPos pos = this.blockPosition();
+        BlockPos best = null;
+        double bestDist = Double.MAX_VALUE;
+
+        for (int dx = -radius; dx <= radius; dx += 3) {
+            for (int dz = -radius; dz <= radius; dz += 3) {
+                for (int dy = -2; dy <= 2; dy++) {
+                    BlockPos check = pos.offset(dx, dy, dz);
+                    // İçerisi boş, çatısı var, ışık az = sığınak
+                    if (this.level().isEmptyBlock(check) &&
+                        !this.level().isEmptyBlock(check.above()) &&
+                        this.level().getMaxLocalRawBrightness(check) < 8) {
+                        double d = pos.distSqr(check);
+                        if (d < bestDist) { bestDist = d; best = check; }
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    // ── Dünya Algısı ──────────────────────────────────────────────────────────
+
+    /**
+     * FoxAI'nin etrafındaki dünyayı analiz eder ve AI'ye gönderilecek context üretir.
+     * Server-side çalışır, her 2 saniyede bir güncellenir.
+     */
+    public String buildWorldContext() {
+        if (this.level().isClientSide()) return "";
+        StringBuilder ctx = new StringBuilder();
+        BlockPos pos = this.blockPosition();
+
+        // ── FoxAI Durumu ──
+        ctx.append("=== FOXAİ DURUMU ===
+");
+        ctx.append("Konum: ").append(pos.getX()).append(", ").append(pos.getY()).append(", ").append(pos.getZ()).append("
+");
+        ctx.append("Can: ").append((int) this.getHealth()).append("/").append((int) this.getMaxHealth()).append("
+");
+        ctx.append("Meşgul: ").append(isBusy ? "EVET (" + actionQueue.size() + " aksiyon bekliyor)" : "hayır").append("
+");
+
+        // Elimdeki alet
+        var mainHand = this.getMainHandItem();
+        if (!mainHand.isEmpty())
+            ctx.append("Elimde: ").append(mainHand.getDisplayName().getString()).append("
+");
+
+        // Zırh
+        StringBuilder armor = new StringBuilder();
+        this.getArmorSlots().forEach(s -> { if (!s.isEmpty()) armor.append(s.getDisplayName().getString()).append(", "); });
+        if (!armor.isEmpty()) ctx.append("Zırh: ").append(armor).append("
+");
+
+        // Envanter özeti (ilk 9 slot)
+        StringBuilder inv = new StringBuilder();
+        for (int i = 0; i < Math.min(9, this.inventory.getContainerSize()); i++) {
+            var st = this.inventory.getItem(i);
+            if (!st.isEmpty()) inv.append(st.getDisplayName().getString()).append("x").append(st.getCount()).append(", ");
+        }
+        if (!inv.isEmpty()) ctx.append("Envanter: ").append(inv).append("
+");
+
+        // ── Etraftaki Bloklar ──
+        ctx.append("
+=== ETRAFTAKİ BLOKLAR (8 blok radius) ===
+");
+        java.util.Map<String, Integer> blockCounts = new java.util.TreeMap<>();
+        boolean nearLava = false, nearWater = false, nearVoid = false;
+        int radius = 8;
+
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dy = -4; dy <= 4; dy++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    BlockPos bp = pos.offset(dx, dy, dz);
+                    var state = this.level().getBlockState(bp);
+                    if (state.isAir()) continue;
+                    String id = net.minecraftforge.registries.ForgeRegistries.BLOCKS
+                        .getKey(state.getBlock()) != null
+                        ? net.minecraftforge.registries.ForgeRegistries.BLOCKS.getKey(state.getBlock()).getPath()
+                        : "unknown";
+                    // Kategorize et
+                    String cat = categorizeBlock(id);
+                    if (cat == null) continue;
+                    if (id.contains("lava")) { nearLava = true; continue; }
+                    if (id.contains("water")) { nearWater = true; continue; }
+                    blockCounts.merge(cat, 1, Integer::sum);
+                }
+            }
+        }
+        // Uçurum kontrolü (ayakların altında 5 blok boşluk)
+        for (int dy = -1; dy >= -5; dy--) {
+            if (this.level().getBlockState(pos.offset(0, dy, 0)).isAir()) {
+                if (dy <= -4) nearVoid = true;
+            } else break;
+        }
+
+        blockCounts.forEach((cat, count) -> ctx.append(cat).append(": ").append(count).append(" blok
+"));
+        if (nearLava) ctx.append("⚠ YAKINDA LAV VAR!
+");
+        if (nearWater) ctx.append("Yakında su var
+");
+        if (nearVoid) ctx.append("⚠ YAKINDA UÇURUM VAR!
+");
+
+        // ── Yakındaki Entityler ──
+        ctx.append("
+=== YAKIN ENTİTYLER ===
+");
+        var entities = this.level().getEntitiesOfClass(
+            net.minecraft.world.entity.LivingEntity.class,
+            new AABB(pos).inflate(16),
+            e -> e != this && e.isAlive()
+        );
+
+        int hostileCount = 0, passiveCount = 0, playerCount = 0;
+        StringBuilder hostiles = new StringBuilder();
+        StringBuilder players = new StringBuilder();
+        StringBuilder passives = new StringBuilder();
+
+        for (var e : entities) {
+            double dist = Math.round(this.distanceTo(e) * 10.0) / 10.0;
+            String name = e.getName().getString();
+            String distStr = " (" + dist + " blok)";
+
+            if (e instanceof net.minecraft.world.entity.player.Player p) {
+                playerCount++;
+                players.append(p.getName().getString()).append(distStr).append(", ");
+            } else if (e instanceof net.minecraft.world.entity.monster.Monster) {
+                hostileCount++;
+                hostiles.append(name).append(distStr).append(", ");
+            } else {
+                passiveCount++;
+                if (passiveCount <= 5) passives.append(name).append(distStr).append(", ");
+            }
+        }
+
+        if (hostileCount > 0) ctx.append("⚔ Düşmanlar: ").append(hostiles).append("
+");
+        if (playerCount > 0) ctx.append("👤 Oyuncular: ").append(players).append("
+");
+        if (passiveCount > 0) ctx.append("🐄 Pasif: ").append(passives).append(passiveCount > 5 ? "+" + (passiveCount-5) + " daha" : "").append("
+");
+        if (entities.isEmpty()) ctx.append("Etrafta kimse yok
+");
+
+        // ── Çevre Durumu ──
+        ctx.append("
+=== ÇEVRE ===
+");
+        ctx.append("Gece: ").append(this.level().isNight() ? "EVET (tehlikeli!)" : "hayır").append("
+");
+        ctx.append("Yağmur: ").append(this.level().isRaining() ? "EVET" : "hayır").append("
+");
+        ctx.append("Işık seviyesi: ").append(this.level().getMaxLocalRawBrightness(pos)).append("/15
+");
+
+        // Yakında crafting table var mı?
+        BlockPos table = findBlock("crafting_table", 16);
+        ctx.append("Crafting table: ").append(table != null ? "VAR (" + (int)Math.sqrt(this.blockPosition().distSqr(table)) + " blok)" : "yok").append("
+");
+
+        // Yakında yatakta uyku var mı?
+        BlockPos bed = findBlock("bed", 16);
+        ctx.append("Yatak: ").append(bed != null ? "VAR" : "yok").append("
+");
+
+        return ctx.toString();
+    }
+
+    /** Blok ID'sini anlamlı bir kategoriye çevirir. null = önemsiz */
+    private String categorizeBlock(String id) {
+        if (id.contains("log") || id.contains("wood")) return "Ağaç/Log";
+        if (id.contains("leaves")) return null; // yaprakları say
+        if (id.contains("diamond_ore")) return "💎 Elmas Cevheri";
+        if (id.contains("iron_ore") || id.contains("deepslate_iron")) return "Demir Cevheri";
+        if (id.contains("gold_ore")) return "Altın Cevheri";
+        if (id.contains("coal_ore")) return "Kömür Cevheri";
+        if (id.contains("emerald_ore")) return "Zümrüt Cevheri";
+        if (id.contains("_ore")) return "Cevher";
+        if (id.contains("stone") || id.contains("cobblestone") || id.contains("deepslate")) return "Taş";
+        if (id.contains("dirt") || id.contains("grass") || id.contains("podzol")) return "Toprak";
+        if (id.contains("sand") || id.contains("gravel")) return "Kum/Çakıl";
+        if (id.contains("chest")) return "📦 Sandık";
+        if (id.contains("crafting_table")) return "🔨 Crafting Table";
+        if (id.contains("furnace")) return "🔥 Fırın";
+        if (id.contains("bed")) return "🛏 Yatak";
+        if (id.contains("door") || id.contains("fence") || id.contains("wall")) return "Yapı Bloğu";
+        if (id.equals("air") || id.contains("void")) return null;
+        return null; // önemsiz blokları atla
     }
 
     // ── Yardımcı Metotlar ──────────────────────────────────────────────────

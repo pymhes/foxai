@@ -225,6 +225,12 @@ public class ChatEventHandler {
         String modContext = ModDetector.buildModContext();
         if (!modContext.isEmpty()) ctx.append("\n").append(modContext);
 
+        // FoxAI'nin dünya algısı (server'dan gelen gerçek zamanlı veri)
+        String foxCtx = FoxAIContextCache.get();
+        if (foxCtx != null && !foxCtx.isEmpty()) {
+            ctx.append("\n").append(foxCtx);
+        }
+
         return ctx.toString();
     }
 
