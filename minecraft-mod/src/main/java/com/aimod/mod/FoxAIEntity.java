@@ -105,8 +105,7 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
         return 4; // Normal fall damage limiti
     }
 
-    @Override
-    protected float getStepHeight() {
+    public float getStepHeight() {
         return 1.0f; // Vanilla 0.6f, biz 1 blok tırmanabiliriz
     }
 
@@ -196,7 +195,6 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
         this.targetSelector.addGoal(2, new NearestAttackableTargetGoal<>(this, Monster.class, true));
     }
 
-    @Override
     public boolean canSwim() { return true; }
 
     @Override
@@ -1492,26 +1490,20 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
         BlockPos pos = this.blockPosition();
 
         // ── FoxAI Durumu ──
-        ctx.append("=== FOXAİ DURUMU ===
-");
-        ctx.append("Konum: ").append(pos.getX()).append(", ").append(pos.getY()).append(", ").append(pos.getZ()).append("
-");
-        ctx.append("Can: ").append((int) this.getHealth()).append("/").append((int) this.getMaxHealth()).append("
-");
-        ctx.append("Meşgul: ").append(isBusy ? "EVET (" + actionQueue.size() + " aksiyon bekliyor)" : "hayır").append("
-");
+        ctx.append("=== FOXAİ DURUMU ===\n");
+        ctx.append("Konum: ").append(pos.getX()).append(", ").append(pos.getY()).append(", ").append(pos.getZ()).append("\n");
+        ctx.append("Can: ").append((int) this.getHealth()).append("/").append((int) this.getMaxHealth()).append("\n");
+        ctx.append("Meşgul: ").append(isBusy ? "EVET (" + actionQueue.size() + " aksiyon bekliyor)" : "hayır").append("\n");
 
         // Elimdeki alet
         var mainHand = this.getMainHandItem();
         if (!mainHand.isEmpty())
-            ctx.append("Elimde: ").append(mainHand.getDisplayName().getString()).append("
-");
+            ctx.append("Elimde: ").append(mainHand.getDisplayName().getString()).append("\n");
 
         // Zırh
         StringBuilder armor = new StringBuilder();
         this.getArmorSlots().forEach(s -> { if (!s.isEmpty()) armor.append(s.getDisplayName().getString()).append(", "); });
-        if (!armor.isEmpty()) ctx.append("Zırh: ").append(armor).append("
-");
+        if (!armor.isEmpty()) ctx.append("Zırh: ").append(armor).append("\n");
 
         // Envanter özeti (ilk 9 slot)
         StringBuilder inv = new StringBuilder();
@@ -1519,13 +1511,10 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
             var st = this.inventory.getItem(i);
             if (!st.isEmpty()) inv.append(st.getDisplayName().getString()).append("x").append(st.getCount()).append(", ");
         }
-        if (!inv.isEmpty()) ctx.append("Envanter: ").append(inv).append("
-");
+        if (!inv.isEmpty()) ctx.append("Envanter: ").append(inv).append("\n");
 
         // ── Etraftaki Bloklar ──
-        ctx.append("
-=== ETRAFTAKİ BLOKLAR (8 blok radius) ===
-");
+        ctx.append("\n=== ETRAFTAKİ BLOKLAR (8 blok radius) ===\n");
         java.util.Map<String, Integer> blockCounts = new java.util.TreeMap<>();
         boolean nearLava = false, nearWater = false, nearVoid = false;
         int radius = 8;
@@ -1556,19 +1545,13 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
             } else break;
         }
 
-        blockCounts.forEach((cat, count) -> ctx.append(cat).append(": ").append(count).append(" blok
-"));
-        if (nearLava) ctx.append("⚠ YAKINDA LAV VAR!
-");
-        if (nearWater) ctx.append("Yakında su var
-");
-        if (nearVoid) ctx.append("⚠ YAKINDA UÇURUM VAR!
-");
+        blockCounts.forEach((cat, count) -> ctx.append(cat).append(": ").append(count).append(" blok\n"));
+        if (nearLava) ctx.append("⚠ YAKINDA LAV VAR!\n");
+        if (nearWater) ctx.append("Yakında su var\n");
+        if (nearVoid) ctx.append("⚠ YAKINDA UÇURUM VAR!\n");
 
         // ── Yakındaki Entityler ──
-        ctx.append("
-=== YAKIN ENTİTYLER ===
-");
+        ctx.append("\n=== YAKIN ENTİTYLER ===\n");
         var entities = this.level().getEntitiesOfClass(
             net.minecraft.world.entity.LivingEntity.class,
             new AABB(pos).inflate(16),
@@ -1597,35 +1580,24 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
             }
         }
 
-        if (hostileCount > 0) ctx.append("⚔ Düşmanlar: ").append(hostiles).append("
-");
-        if (playerCount > 0) ctx.append("👤 Oyuncular: ").append(players).append("
-");
-        if (passiveCount > 0) ctx.append("🐄 Pasif: ").append(passives).append(passiveCount > 5 ? "+" + (passiveCount-5) + " daha" : "").append("
-");
-        if (entities.isEmpty()) ctx.append("Etrafta kimse yok
-");
+        if (hostileCount > 0) ctx.append("⚔ Düşmanlar: ").append(hostiles).append("\n");
+        if (playerCount > 0) ctx.append("👤 Oyuncular: ").append(players).append("\n");
+        if (passiveCount > 0) ctx.append("🐄 Pasif: ").append(passives).append(passiveCount > 5 ? "+" + (passiveCount-5) + " daha" : "").append("\n");
+        if (entities.isEmpty()) ctx.append("Etrafta kimse yok\n");
 
         // ── Çevre Durumu ──
-        ctx.append("
-=== ÇEVRE ===
-");
-        ctx.append("Gece: ").append(this.level().isNight() ? "EVET (tehlikeli!)" : "hayır").append("
-");
-        ctx.append("Yağmur: ").append(this.level().isRaining() ? "EVET" : "hayır").append("
-");
-        ctx.append("Işık seviyesi: ").append(this.level().getMaxLocalRawBrightness(pos)).append("/15
-");
+        ctx.append("\n=== ÇEVRE ===\n");
+        ctx.append("Gece: ").append(this.level().isNight() ? "EVET (tehlikeli!)" : "hayır").append("\n");
+        ctx.append("Yağmur: ").append(this.level().isRaining() ? "EVET" : "hayır").append("\n");
+        ctx.append("Işık seviyesi: ").append(this.level().getMaxLocalRawBrightness(pos)).append("/15\n");
 
         // Yakında crafting table var mı?
         BlockPos table = findBlock("crafting_table", 16);
-        ctx.append("Crafting table: ").append(table != null ? "VAR (" + (int)Math.sqrt(this.blockPosition().distSqr(table)) + " blok)" : "yok").append("
-");
+        ctx.append("Crafting table: ").append(table != null ? "VAR (" + (int)Math.sqrt(this.blockPosition().distSqr(table)) + " blok)" : "yok").append("\n");
 
         // Yakında yatakta uyku var mı?
         BlockPos bed = findBlock("bed", 16);
-        ctx.append("Yatak: ").append(bed != null ? "VAR" : "yok").append("
-");
+        ctx.append("Yatak: ").append(bed != null ? "VAR" : "yok").append("\n");
 
         return ctx.toString();
     }
