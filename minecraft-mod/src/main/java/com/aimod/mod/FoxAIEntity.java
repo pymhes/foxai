@@ -50,7 +50,7 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
     // ── Görev Zinciri Sistemi ─────────────────────────────────────────────
     public final FoxAITaskSystem taskSystem = new FoxAITaskSystem(this);
 
-    private enum CraftState { IDLE, GATHERING_WOOD, GOING_TO_TABLE, CRAFTING }
+    enum CraftState { IDLE, GATHERING_WOOD, GOING_TO_TABLE, CRAFTING } // package-private: inner class erişir
     private CraftState craftState = CraftState.IDLE;
     private String pendingToolType = null;
     private int craftWaitTicks = 0;
@@ -122,16 +122,28 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
     @Override
     public InteractionResult mobInteract(Player player, InteractionHand hand) {
         if (!this.level().isClientSide() && hand == InteractionHand.MAIN_HAND) {
-            player.openMenu(this);
+            // Anonim MenuProvider: GUI başlığı "FoxAI Envanteri",
+            // entity name tag getCustomName() = "FoxAI [Bot]" olarak kalır
+            player.openMenu(new net.minecraft.world.MenuProvider() {
+                @Override
+                public Component getDisplayName() {
+                    return Component.literal("FoxAI Envanteri");
+                }
+                @Override
+                public AbstractContainerMenu createMenu(int windowId, Inventory playerInv, Player p) {
+                    return new FoxAIContainer(windowId, playerInv, FoxAIEntity.this.inventory);
+                }
+            });
             return InteractionResult.SUCCESS;
         }
         return InteractionResult.sidedSuccess(this.level().isClientSide());
     }
 
-    // MenuProvider implementasyonu — sadece GUI başlığı için
+    // Entity name tag — setCustomName("FoxAI [Bot]") değerini döndürür
     @Override
     public Component getDisplayName() {
-        return Component.literal("FoxAI Envanteri");
+        Component name = this.getCustomName();
+        return name != null ? name : Component.literal("FoxAI [Bot]");
     }
 
     @Override
@@ -231,18 +243,22 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
                 if (el.isJsonObject()) actionQueue.add(el.getAsJsonObject());
             }
             broadcastToNearby("§7▶ " + actionQueue.size() + " adım kuyruğa alındı!");
+            FoxAILog.info("Kuyruk: " + actionQueue.size() + " aksiyon yüklendi");
         } catch (Exception e) {
+            FoxAILog.error("JSON parse hatası: " + json.substring(0, Math.min(100, json.length())), e);
             AiPlayerMod.LOGGER.error("[FoxAI] JSON parse hatası: {}", e.getMessage());
         }
     }
 
     public void clearQueue() {
+        int cleared = actionQueue.size();
         actionQueue.clear();
         currentAction = null;
         isBusy = false;
         this.getNavigation().stop();
         this.setTarget(null);
         broadcastToNearby("§c🛑 Durdum.");
+        FoxAILog.info("DURDURULDU — " + cleared + " aksiyon iptal edildi");
     }
 
     public boolean isBusy() { return isBusy; }
@@ -323,27 +339,44 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
                 fox.actionTimer = 0;
             }
 
+            // İlk tick'te aksiyonu logla
+            if (fox.actionTimer == 0) {
+                String logType   = str(fox.currentAction, "type");
+                String logTarget = str(fox.currentAction, "target");
+                String logExtra  = str(fox.currentAction, "extra");
+                String logDetail = (logTarget.isEmpty() ? "" : logTarget)
+                    + (logExtra.isEmpty() ? "" : " / " + logExtra);
+                FoxAILog.action(logType, logDetail.isEmpty() ? "-" : logDetail);
+            }
+
             boolean done = fox.processAction(fox.currentAction);
             fox.actionTimer++;
 
             int maxTicks = getMaxTicks(fox.currentAction);
             if (done || fox.actionTimer > maxTicks) {
+                // Tamamlandı mı, timeout mu?
+                String doneType = str(fox.currentAction, "type");
+                FoxAILog.actionDone(doneType, done, fox.actionTimer);
                 fox.currentAction = null;
                 cooldown = 4;
             }
         }
 
         private int getMaxTicks(JsonObject a) {
+            int qty = a.has("quantity") && !a.get("quantity").isJsonNull()
+                ? a.get("quantity").getAsInt() : 1;
+            // craftState aktifse alet yapımı 400+ tick sürebilir — bunu hesaba kat
+            int craftOverhead = (fox.craftState != FoxAIEntity.CraftState.IDLE) ? 400 : 0;
             return switch (str(a, "type")) {
-                // mine: craft + ağaç topla + crafting table'a git + kaz = 600 tick (30sn)
-                case "mine"   -> 600;
-                case "move", "sprint" -> 100;
-                case "attack" -> 80;
+                case "mine"   -> Math.max(600, qty * 120 + 200);
+                case "attack" -> 300 + craftOverhead; // craft gerekiyorsa süre uzar
+                case "move", "sprint" -> 120;
                 case "follow", "guard" -> 200;
                 case "wait"   -> 60;
                 case "eat"    -> 50;
-                case "craft", "smelt" -> 200;
-                default -> 40;
+                case "craft", "smelt" -> 400 + craftOverhead;
+                case "farm"   -> 600;
+                default -> 60;
             };
         }
     }
@@ -651,6 +684,9 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
         return false;
     }
 
+    // ── Mine state ────────────────────────────────────────────────────────
+    private int mineRemaining = 0;  // Kalan blok sayısı (executeMine için)
+
     // ── Kazma ─────────────────────────────────────────────────────────────
 
     private boolean executeMine(String blockName, int qty, int radius) {
@@ -658,23 +694,36 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
         String toolType = getToolTypeForBlock(blockName);
         if (!ensureTool(toolType)) return false; // alet hazır değil
 
-        if (actionTimer == 0)
+        // İlk tick'te mineRemaining başlat
+        if (actionTimer == 0) {
+            mineRemaining = qty;
             broadcastToNearby("⛏️ §e" + coal(blockName,"blok") + " §7x" + qty + " kırıyorum!");
+        }
+
+        // Tüm blokları kırdıysak bitti
+        if (mineRemaining <= 0) return true;
 
         BlockPos found = findBlock(blockName, radius);
         if (found == null) {
-            if (actionTimer > 60) { broadcastToNearby("⛏️ §e" + coal(blockName,"blok") + " §7bulunamadı."); return true; }
+            // Blok bulunamadı — biraz bekle, belki düştü
+            if (actionTimer % 20 == 0) pickupNearbyItems();
+            if (actionTimer > 80) {
+                broadcastToNearby("⛏️ §e" + coal(blockName,"blok") + " §7bulunamadı. (" + mineRemaining + " kaldı)");
+                return true;
+            }
             return false;
         }
 
         double dist = this.distanceToSqr(Vec3.atCenterOf(found));
-        if (dist > 6.0) { // 2.5 blok mesafe yeterli
-            // Hedefe giderken takılıyor mu?
-            if (actionTimer % 15 == 0 && this.getNavigation().isInProgress()) {
-                // Path yenile
+        if (dist > 6.0) {
+            // Ağaca/bloğa git — sadece navigation durduğunda yeniden başlat (SPAM önlemi)
+            if (!this.getNavigation().isInProgress()) {
+                this.jumpFromGround();
                 this.getNavigation().moveTo(found.getX()+0.5, found.getY(), found.getZ()+0.5, 1.2);
-            } else if (!this.getNavigation().isInProgress()) {
-                this.jumpFromGround(); // Belki bir blok önünde duvar var
+                broadcastToNearby("🌲 ağaca gidiyorum...");
+            }
+            // Takılma: 40 tick ilerleme yoksa path yenile
+            if (actionTimer % 40 == 0 && this.getNavigation().isInProgress()) {
                 this.getNavigation().moveTo(found.getX()+0.5, found.getY(), found.getZ()+0.5, 1.2);
             }
             return false;
@@ -687,10 +736,17 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
         if (!this.level().isClientSide()) {
             String bName = this.level().getBlockState(found).getBlock().getName().getString();
             this.level().destroyBlock(found, true, this);
+            mineRemaining--;
             pickupNearbyItems();
-            broadcastToNearby("⛏️ §e" + bName + " §7kırıldı! " + (qty > 1 ? (qty-1) + " kaldı" : ""));
+            if (mineRemaining > 0) {
+                broadcastToNearby("⛏️ §e" + bName + " §7kırıldı! §7" + mineRemaining + " kaldı");
+                FoxAILog.action("mine", bName + " kırıldı, kalan: " + mineRemaining);
+            } else {
+                broadcastToNearby("⛏️ §e" + bName + " §7kırıldı! Bitti 🎉");
+                FoxAILog.action("mine", bName + " kırıldı — TAMAMLANDI");
+            }
         }
-        return qty <= 1;
+        return mineRemaining <= 0;
     }
 
     // ── Craft State Machine ────────────────────────────────────────────────
@@ -707,21 +763,23 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
                 // Önce yerdeki itemleri topla
                 pickupNearbyItems();
 
-                if (hasCraftMaterials(toolType)) {
+                if (hasCraftMaterials(pendingToolType != null ? pendingToolType : toolType)) {
                     broadcastToNearby("📦 malzeme tamam, crafting table'a gidiyorum!");
                     craftState = CraftState.GOING_TO_TABLE;
                     return false;
                 }
 
-                BlockPos tree = findBlock("log", 20);
+                BlockPos tree = findBlock("log", 24);
                 if (tree == null) {
-                    broadcastToNearby("§cMalzeme ve ağaç bulunamadı! Elle kırıyorum 😅");
-                    this.setItemInHand(InteractionHand.MAIN_HAND, ItemStack.EMPTY);
-                    return true;
+                    broadcastToNearby("§cYakında ağaç bulunamadı! Eldeki malzemeyle devam ediyorum.");
+                    // Yeterli malzeme yoksa crafting'e geç (sihirli craft dener)
+                    craftState = CraftState.CRAFTING;
+                    return false;
                 }
 
                 double dist = this.distanceToSqr(Vec3.atCenterOf(tree));
                 if (dist > 9.0) {
+                    // Sadece navigation durduğunda yeniden başlat (spam önleme)
                     if (!this.getNavigation().isInProgress()) {
                         broadcastToNearby("🌲 ağaca gidiyorum...");
                         this.getNavigation().moveTo(tree.getX()+0.5, tree.getY(), tree.getZ()+0.5, 1.2);
@@ -729,16 +787,21 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
                     return false;
                 }
 
+                // Ağaç yanındayız — kes
                 if (!this.level().isClientSide()) {
+                    String logName = this.level().getBlockState(tree).getBlock().getName().getString();
                     this.level().destroyBlock(tree, true, this);
-                    broadcastToNearby("🪵 kestim, topluyorum...");
+                    craftWaitTicks++;
+                    // Item'ların yere düşmesi için biraz bekle
+                    if (craftWaitTicks < 6) return false;
+                    pickupNearbyItems();
+                    craftWaitTicks = 0;
+                    broadcastToNearby("🪵 " + logName + " kestim! (log: " + countItem("log") + ")");
                 }
-                craftWaitTicks++;
-                if (craftWaitTicks < 5) return false;
-                pickupNearbyItems();
-                craftWaitTicks = 0;
-                broadcastToNearby("🪵 topladım! (" + countItem("log") + " log)");
-                if (hasCraftMaterials(toolType)) craftState = CraftState.GOING_TO_TABLE;
+                // Yeterli malzeme olduysa ilerle
+                if (hasCraftMaterials(pendingToolType != null ? pendingToolType : toolType)) {
+                    craftState = CraftState.GOING_TO_TABLE;
+                }
                 return false;
             }
 
@@ -782,39 +845,22 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
             case CRAFTING -> {
                 if (++craftWaitTicks < 8) return false;
 
-                // Önce gerçek craft
+                // Önce gerçek craft (kendi mesajını yazıyor)
                 if (tryCraftTool(toolType)) {
-                    equipBestTool(toolType);
-                    broadcastToNearby("✅ §e" + this.getMainHandItem().getDisplayName().getString()
-                        + " §7yaptım! Let's go kanka 🎉");
                     return true;
                 }
 
-                // tryCraftTool başarısız → son çare sihirli craft
-                // NOT: Bu noktaya sadece malzeme gerçekten yoksa gelinir
-                broadcastToNearby("⚠ malzeme yetersiz, sihirle yapıyorum 🪄");
+                // tryCraftTool başarısız → son çare: elimizde hiç malzeme yoksa
+                // en azından tahta alet ver (tamamen boş kalmayalım)
+                broadcastToNearby("⚠ malzeme yetersiz, tahta alet veriyorum 🪄");
                 net.minecraft.world.item.Item magic = getMagicCraftItem(toolType);
                 if (magic != null && !this.level().isClientSide()) {
-                    // Sihirli craftta da mevcut malzemeleri tüket (ne kadar varsa)
-                    String mat = getBestMaterial();
-                    int neededMat = switch (toolType) { case "sword" -> 2; case "shovel" -> 1; default -> 3; };
-                    int neededStick = "sword".equals(toolType) ? 1 : 2;
-                    // Stick yoksa üret
-                    if (countItem("stick") < neededStick && countItem("planks") >= 2) {
-                        consumeItem("planks", 2);
-                        giveItem(new net.minecraft.world.item.ItemStack(Items.STICK, 4));
-                    } else if (countItem("stick") < neededStick && countItem("log") >= 1) {
-                        consumeItem("log", 1);
-                        giveItem(new net.minecraft.world.item.ItemStack(Items.OAK_PLANKS, 4));
-                        consumeItem("planks", 2);
-                        giveItem(new net.minecraft.world.item.ItemStack(Items.STICK, 4));
-                    }
-                    // Elindeki kadar malzemeyi tüket
-                    consumeItem(mat, Math.min(neededMat, countItem(mat)));
-                    consumeItem("stick", Math.min(neededStick, countItem("stick")));
-                    giveItem(new net.minecraft.world.item.ItemStack(magic, 1));
+                    ItemStack magicTool = new net.minecraft.world.item.ItemStack(magic, 1);
+                    giveItem(magicTool);
                     equipBestTool(toolType);
-                    broadcastToNearby("✅ §e" + this.getMainHandItem().getDisplayName().getString() + " §7yaptım!");
+                    // İsim için result'tan al (getMainHandItem boş olabilir)
+                    String toolName = magic.getDescriptionId().replace("item.minecraft.", "");
+                    broadcastToNearby("✅ §e" + toolName + " §7hazır! 🎉");
                 }
                 return true;
             }
@@ -825,13 +871,55 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
 
     /** Alet yapmak için yeterli malzeme var mı? */
     private boolean hasCraftMaterials(String toolType) {
-        int needed = 2; // 2 yeterli (sword için de, diğerleri için de)
-        return countItem("diamond") >= needed ||
-               countItem("iron_ingot") >= needed ||
-               countItem("cobblestone") >= needed ||
-               countItem("stone") >= needed ||
-               countItem("planks") >= needed ||
-               countItem("log") >= 1; // 1 log → 4 planks → yeterli
+        int neededMat = switch (toolType != null ? toolType : "axe") {
+            case "sword"  -> 2;
+            case "shovel" -> 1;
+            default       -> 3; // axe, pickaxe
+        };
+        int neededStick = switch (toolType != null ? toolType : "axe") {
+            case "sword" -> 1;
+            default      -> 2;
+        };
+        // Stick üretilebilir mi?
+        boolean canMakeStick = countItem("stick") >= neededStick
+            || countItem("planks") >= 2
+            || countItem("log") >= 1;
+
+        // NOT: "cobblestone" kullan, "stone" değil — stone_axe gibi aletler "stone" içeriyor!
+        return canMakeStick && (
+               countItem("diamond")     >= neededMat ||
+               countItem("iron_ingot")  >= neededMat ||
+               countCobblestone()       >= neededMat ||
+               (countItem("planks") + countItem("log") * 4) >= (neededMat + neededStick)
+        );
+    }
+
+    /** Sadece cobblestone bloklarını say — stone_axe gibi aletleri SAYMA */
+    private int countCobblestone() {
+        int count = 0;
+        // SimpleContainer
+        for (int i = 0; i < inventory.getContainerSize(); i++) {
+            ItemStack st = inventory.getItem(i);
+            if (st.isEmpty()) continue;
+            String id = st.getDescriptionId().toLowerCase();
+            // Sadece blok: cobblestone, mossy_cobblestone — alet değil
+            if (id.equals("block.minecraft.cobblestone")
+                    || id.equals("block.minecraft.mossy_cobblestone")
+                    || id.equals("block.minecraft.cobbled_deepslate")) {
+                count += st.getCount();
+            }
+        }
+        // El slotları
+        for (ItemStack st : this.getHandSlots()) {
+            if (st.isEmpty()) continue;
+            String id = st.getDescriptionId().toLowerCase();
+            if (id.equals("block.minecraft.cobblestone")
+                    || id.equals("block.minecraft.mossy_cobblestone")
+                    || id.equals("block.minecraft.cobbled_deepslate")) {
+                count += st.getCount();
+            }
+        }
+        return count;
     }
 
     /**
@@ -848,13 +936,8 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
     private boolean tryCraftTool(String toolType) {
         if (this.level().isClientSide()) return false;
         try {
-            net.minecraft.world.item.Item result = getMagicCraftItem(toolType);
-            if (result == null) return false;
-
-            String material = getBestMaterial();
-
             // Her alet tipi için gereken miktarlar (Minecraft tarifleri)
-            int neededMat   = switch (toolType) {
+            int neededMat = switch (toolType) {
                 case "sword"  -> 2;
                 case "shovel" -> 1;
                 default       -> 3; // axe, pickaxe
@@ -864,99 +947,171 @@ public class FoxAIEntity extends PathfinderMob implements MenuProvider {
                 default      -> 2; // axe, pickaxe, shovel
             };
 
-            // Stick yoksa üret: log → planks → stick
-            if (countItem("stick") < neededStick) {
-                // Planks yoksa logdan üret
-                if (countItem("planks") < 2 && countItem("log") >= 1) {
-                    consumeItem("log", 1);
-                    giveItem(new net.minecraft.world.item.ItemStack(Items.OAK_PLANKS, 4));
-                    broadcastToNearby("🪵 log → 4 tahta yaptım");
-                }
-                // Stickları üret
-                if (countItem("planks") >= 2) {
-                    consumeItem("planks", 2);
-                    giveItem(new net.minecraft.world.item.ItemStack(Items.STICK, 4));
-                    broadcastToNearby("🥢 tahta → çubuk yaptım");
-                }
+            // ADIM 1: İhtiyaç hesapla — hem malzeme hem stick için planks lazım
+            // Örnek: axe = 3 planks malzeme + 2 planks (stick için) = toplam 5 planks
+            int planksForSticks = (countItem("stick") < neededStick) ? 2 : 0;
+            int totalPlanksNeeded = neededMat + planksForSticks;
+
+            // ADIM 2: Log → Planks (yeterince plank yoksa)
+            int currentPlanks = countItem("planks");
+            if (currentPlanks < totalPlanksNeeded && countItem("log") >= 1) {
+                int planksShortfall = totalPlanksNeeded - currentPlanks;
+                int logsToUse = Math.max(1, (int) Math.ceil(planksShortfall / 4.0));
+                logsToUse = Math.min(logsToUse, countItem("log"));
+                consumeItem("log", logsToUse);
+                giveItem(new net.minecraft.world.item.ItemStack(Items.OAK_PLANKS, logsToUse * 4));
+                broadcastToNearby("🪵 " + logsToUse + " log → " + (logsToUse * 4) + " tahta");
             }
 
-            // Malzeme ve stick yeterli mi?
+            // ADIM 3: Planks → Stick zinciri (gerekirse)
+            if (countItem("stick") < neededStick && countItem("planks") >= 2) {
+                consumeItem("planks", 2);
+                giveItem(new net.minecraft.world.item.ItemStack(Items.STICK, 4));
+                broadcastToNearby("🥢 tahta → çubuk yaptım");
+            }
+
+            // ADIM 4: En iyi malzemeyi seç (cobblestone varsa cobblestone, yoksa planks)
+            String material = getBestMaterial();
+
+            // ADIM 5: Malzeme ve stick yeterli mi?
             if (countItem("stick") < neededStick || countItem(material) < neededMat) {
+                String reason = "Lazım: " + neededMat + "x " + material + " + " + neededStick
+                    + "x stick | Var: " + countItem(material) + " " + material
+                    + ", " + countItem("stick") + " stick"
+                    + ", " + countItem("log") + " log, " + countItem("planks") + " planks";
                 broadcastToNearby("§cMalzeme yetmedi: " + neededMat + "x " + material
-                    + " + " + neededStick + "x stick lazım");
+                    + " + " + neededStick + "x stick lazım (var: "
+                    + countItem(material) + " " + material + ", "
+                    + countItem("stick") + " stick)");
+                FoxAILog.warn("CRAFT BAŞARISIZ — " + reason);
                 return false;
             }
 
-            // Malzemeleri tüket ve aleti ver
+            // ADIM 6: Üretilecek item
+            net.minecraft.world.item.Item result = getMagicCraftItem(toolType);
+            if (result == null) {
+                broadcastToNearby("§c" + toolType + " için craft tarifi bulunamadı!");
+                return false;
+            }
+
+            // ADIM 7: Malzemeleri tüket ve aleti ver
             consumeItem(material, neededMat);
             consumeItem("stick", neededStick);
-            giveItem(new net.minecraft.world.item.ItemStack(result, 1));
+            ItemStack toolStack = new net.minecraft.world.item.ItemStack(result, 1);
+            giveItem(toolStack);
+            equipBestTool(toolType);
+
+            // İsim: result'tan al (getMainHandItem boş olabilir)
+            String toolName = result.getDescriptionId().replace("item.minecraft.", "");
             broadcastToNearby("🔨 " + neededMat + "x §e" + material
-                + " §7+ " + neededStick + "x stick → §e"
-                + result.getDescriptionId().replace("item.minecraft.", "") + " §7✅");
+                + " §7+ " + neededStick + "x stick → §e" + toolName + " §7✅");
+            FoxAILog.craft(toolType, true,
+                neededMat + "x " + material + " + " + neededStick + "x stick → " + toolName);
             return true;
         } catch (Exception e) {
+            FoxAILog.craft(toolType, false, "Exception: " + e.getMessage());
             broadcastToNearby("§cCraft hatası: " + e.getMessage());
             return false;
         }
     }
 
-    /** En iyi mevcut malzemeyi döndür */
+    /** En iyi mevcut malzemeyi döndür.
+     *  NOT: countCobblestone() kullan — stone_axe gibi aletler "stone" içerdiğinden
+     *  countItem("stone") YANLIŞ sonuç verir! */
     private String getBestMaterial() {
-        if (countItem("diamond") >= 2)    return "diamond";
+        if (countItem("diamond")    >= 3) return "diamond";
+        if (countItem("iron_ingot") >= 3) return "iron_ingot";
+        if (countCobblestone()      >= 3) return "cobblestone";
+        if (countItem("diamond")    >= 2) return "diamond";
         if (countItem("iron_ingot") >= 2) return "iron_ingot";
-        // cobblestone veya stone — ikisi de taş alet yapar
-        if (countItem("cobblestone") >= 2 || countItem("stone") >= 2) return "cobblestone";
-        return "planks";
+        if (countCobblestone()      >= 2) return "cobblestone";
+        if (countItem("diamond")    >= 1) return "diamond";
+        if (countItem("iron_ingot") >= 1) return "iron_ingot";
+        if (countCobblestone()      >= 1) return "cobblestone";
+        return "planks"; // tahta alet yap
     }
 
-    /** toolType + mevcut malzemeye göre üretilecek item */
+    /** toolType + mevcut malzemeye göre üretilecek item.
+     *  "planks" → wooden tool (stone tool değil!) */
     private net.minecraft.world.item.Item getMagicCraftItem(String toolType) {
         String mat = getBestMaterial();
         return switch (toolType) {
             case "pickaxe" -> switch (mat) {
-                case "diamond"    -> Items.DIAMOND_PICKAXE;
-                case "iron_ingot" -> Items.IRON_PICKAXE;
-                default           -> Items.STONE_PICKAXE;
+                case "diamond"     -> Items.DIAMOND_PICKAXE;
+                case "iron_ingot"  -> Items.IRON_PICKAXE;
+                case "cobblestone" -> Items.STONE_PICKAXE;
+                default            -> Items.WOODEN_PICKAXE; // planks
             };
             case "axe" -> switch (mat) {
-                case "diamond"    -> Items.DIAMOND_AXE;
-                case "iron_ingot" -> Items.IRON_AXE;
-                default           -> Items.STONE_AXE;
+                case "diamond"     -> Items.DIAMOND_AXE;
+                case "iron_ingot"  -> Items.IRON_AXE;
+                case "cobblestone" -> Items.STONE_AXE;
+                default            -> Items.WOODEN_AXE; // planks
             };
             case "shovel" -> switch (mat) {
-                case "diamond"    -> Items.DIAMOND_SHOVEL;
-                case "iron_ingot" -> Items.IRON_SHOVEL;
-                default           -> Items.STONE_SHOVEL;
+                case "diamond"     -> Items.DIAMOND_SHOVEL;
+                case "iron_ingot"  -> Items.IRON_SHOVEL;
+                case "cobblestone" -> Items.STONE_SHOVEL;
+                default            -> Items.WOODEN_SHOVEL; // planks
             };
             case "sword" -> switch (mat) {
-                case "diamond"    -> Items.DIAMOND_SWORD;
-                case "iron_ingot" -> Items.IRON_SWORD;
-                default           -> Items.STONE_SWORD;
+                case "diamond"     -> Items.DIAMOND_SWORD;
+                case "iron_ingot"  -> Items.IRON_SWORD;
+                case "cobblestone" -> Items.STONE_SWORD;
+                default            -> Items.WOODEN_SWORD; // planks
             };
             default -> null;
         };
     }
 
     /** Envanterdeki belirli item sayısını say (el + zırh slotları) */
-    /** Yakındaki düşmüş itemleri FoxAI'nin eline al */
+    /** Yakındaki düşmüş itemleri FoxAI'nin envanterine al */
     public void pickupNearbyItems() {
         if (this.level().isClientSide()) return;
         var items = this.level().getEntitiesOfClass(
             net.minecraft.world.entity.item.ItemEntity.class,
-            new AABB(this.blockPosition()).inflate(3)
+            new AABB(this.blockPosition()).inflate(4)
         );
         for (var item : items) {
-            if (item.isAlive() && !item.getItem().isEmpty()) {
-                ItemStack stack = item.getItem().copy();
-                // Main hand boşsa al, değilse off-hand'e
-                if (this.getMainHandItem().isEmpty()) {
-                    this.setItemInHand(InteractionHand.MAIN_HAND, stack);
-                } else if (this.getOffhandItem().isEmpty()) {
-                    this.setItemInHand(InteractionHand.OFF_HAND, stack);
+            if (!item.isAlive() || item.getItem().isEmpty()) continue;
+            ItemStack stack = item.getItem().copy();
+            // 1) Önce SimpleContainer'daki mevcut stack ile birleştir
+            boolean merged = false;
+            for (int i = 0; i < inventory.getContainerSize(); i++) {
+                ItemStack existing = inventory.getItem(i);
+                if (!existing.isEmpty()
+                        && ItemStack.isSameItemSameTags(existing, stack)
+                        && existing.getCount() < existing.getMaxStackSize()) {
+                    int space = existing.getMaxStackSize() - existing.getCount();
+                    int take = Math.min(space, stack.getCount());
+                    existing.grow(take);
+                    inventory.setItem(i, existing);
+                    stack.shrink(take);
+                    if (stack.isEmpty()) { merged = true; break; }
                 }
-                item.discard(); // yerdeki entity'yi kaldır
             }
+            if (merged) { item.discard(); continue; }
+            // 2) Boş slot bul
+            if (!stack.isEmpty()) {
+                for (int i = 0; i < inventory.getContainerSize(); i++) {
+                    if (inventory.getItem(i).isEmpty()) {
+                        inventory.setItem(i, stack.copy());
+                        stack = ItemStack.EMPTY;
+                        break;
+                    }
+                }
+            }
+            // 3) Envanter doluysa el slotlarına bak
+            if (!stack.isEmpty()) {
+                if (this.getMainHandItem().isEmpty()) {
+                    this.setItemInHand(InteractionHand.MAIN_HAND, stack.copy());
+                    stack = ItemStack.EMPTY;
+                } else if (this.getOffhandItem().isEmpty()) {
+                    this.setItemInHand(InteractionHand.OFF_HAND, stack.copy());
+                    stack = ItemStack.EMPTY;
+                }
+            }
+            if (stack.isEmpty()) item.discard();
         }
     }
 

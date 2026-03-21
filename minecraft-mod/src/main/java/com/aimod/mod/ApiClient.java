@@ -52,17 +52,25 @@ public class ApiClient {
 
             byte[] bodyBytes = new Gson().toJson(body).getBytes(StandardCharsets.UTF_8);
             conn.setRequestProperty("Content-Length", String.valueOf(bodyBytes.length));
+            long t0 = System.currentTimeMillis();
             try (OutputStream os = conn.getOutputStream()) { os.write(bodyBytes); }
 
             int status = conn.getResponseCode();
+            long ms = System.currentTimeMillis() - t0;
             InputStream is = (status >= 200 && status < 300) ? conn.getInputStream() : conn.getErrorStream();
-            if (is == null) return errorResponse("Sunucudan yanıt yok (HTTP " + status + ")");
+            if (is == null) {
+                FoxAILog.apiError(url.toString(), "Sunucudan yanıt yok (HTTP " + status + ")");
+                return errorResponse("Sunucudan yanıt yok (HTTP " + status + ")");
+            }
 
             StringBuilder sb = new StringBuilder();
             try (BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
                 String line; while ((line = br.readLine()) != null) sb.append(line);
             }
-            if (status < 200 || status >= 300) return errorResponse("Sunucu hatası " + status + ": " + sb);
+            if (status < 200 || status >= 300) {
+                FoxAILog.apiError(url.toString(), "HTTP " + status + ": " + sb);
+                return errorResponse("Sunucu hatası " + status + ": " + sb);
+            }
 
             JsonObject json = JsonParser.parseString(sb.toString()).getAsJsonObject();
             ModChatResponse r = new ModChatResponse();
@@ -72,9 +80,27 @@ public class ApiClient {
             r.actions        = json.has("actions") ? json.get("actions").getAsJsonArray() : new JsonArray();
             r.understood     = !json.has("understood") || json.get("understood").getAsBoolean();
             r.isConversation = json.has("isConversation") && json.get("isConversation").getAsBoolean();
+
+            // Log: API sonucu
+            FoxAILog.api(url.toString(), status, ms, r.reply,
+                r.actions != null ? r.actions.size() : 0);
+            if (r.actions != null && r.actions.size() > 0) {
+                StringBuilder actLog = new StringBuilder();
+                for (com.google.gson.JsonElement el : r.actions) {
+                    if (el.isJsonObject()) {
+                        com.google.gson.JsonObject ao = el.getAsJsonObject();
+                        String t = ao.has("type") ? ao.get("type").getAsString() : "?";
+                        String tg = ao.has("target") && !ao.get("target").isJsonNull()
+                            ? ":" + ao.get("target").getAsString() : "";
+                        actLog.append(t).append(tg).append(", ");
+                    }
+                }
+                FoxAILog.info("Aksiyon listesi → " + actLog);
+            }
             return r;
 
         } catch (Exception e) {
+            FoxAILog.error("API bağlantı hatası", e);
             AiPlayerMod.LOGGER.error("[FoxAI] API hatası: {}", e.getMessage());
             return errorResponse("ya bağlantı koptu knk 😬  (" + e.getMessage() + ")");
         }

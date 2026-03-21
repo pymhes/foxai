@@ -31,7 +31,9 @@ public class AiPlayerMod {
 
         MinecraftForge.EVENT_BUS.register(this);
 
+        FoxAILog.init();
         LOGGER.info("[FoxAI] Mod yükleniyor...");
+        FoxAILog.info("Mod başlatıldı — v1.0.0 (Forge 1.20.1)");
         LOGGER.info("[FoxAI] Botu çağır: /spawn foxai");
         LOGGER.info("[FoxAI] Komut: {} <komut>  |  Sohbet: fox <mesaj>", ModConfig.getTriggerPrefix());
     }

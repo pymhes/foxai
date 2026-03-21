@@ -53,6 +53,9 @@ public class SpawnFoxAICommand {
                             MobSpawnType.COMMAND, null, null);
 
                         level.addFreshEntity(foxai);
+                        FoxAILog.info("FoxAI spawn edildi → konum: " + spawnPos
+                            + " | owner: " + player.getName().getString()
+                            + " | UUID: " + player.getUUID());
 
                         player.displayClientMessage(
                             Component.literal("§a✦ FoxAI çağrıldı! §7Sana yardım etmeye hazırım!"),

@@ -87,7 +87,7 @@ public class ChatEventHandler {
             JsonObject s = new JsonObject();
             s.addProperty("type", "stop");
             stopActions.add(s);
-            FoxAINetwork.CHANNEL.sendToServer(new ActionPacket(stopActions.toString()));
+            FoxAINetwork.CHANNEL.sendToServer(new ActionPacket(stopActions.toString(), player.getUUID()));
             fox(player, "§cDurdum. Ne var ne yok? 👀");
             return;
         }
@@ -101,6 +101,9 @@ public class ChatEventHandler {
         String playerName = player.getName().getString();
         String finalMessage = cleanMessage;
         final boolean finalIsConversation = isConversation;
+
+        // Log: gelen komut
+        FoxAILog.cmd(playerName, finalMessage, isConversation);
 
         // Düşünme animasyonu
         if (!isConversation) {
@@ -146,14 +149,16 @@ public class ChatEventHandler {
                             && response.actions != null && !response.actions.isEmpty()) {
                         fox(mc.player, "§7▶ " + response.actions.size() + " adım FoxAI'ye gönderiliyor...");
                         String json = response.actions.toString();
-                        FoxAINetwork.CHANNEL.sendToServer(new ActionPacket(json));
+                        java.util.UUID uuid = mc.player.getUUID();
+                        FoxAINetwork.CHANNEL.sendToServer(new ActionPacket(json, uuid));
                         // FoxSayPacket ile reply'ı da entity'ye söylet
-                        FoxAINetwork.CHANNEL.sendToServer(new FoxSayPacket(response.reply));
+                        FoxAINetwork.CHANNEL.sendToServer(new FoxSayPacket(response.reply, uuid));
                     }
                 });
 
             } catch (Exception e) {
                 isBusy = false;
+                FoxAILog.error("Chat iş parçacığı hatası: " + e.getMessage(), e);
                 AiPlayerMod.LOGGER.error("[FoxAI] Chat hatası: {}", e.getMessage(), e);
                 mc.execute(() -> {
                     if (mc.player != null) {
